@@ -206,15 +206,20 @@ func dialCommon(c net.Conn, err error) (session *Session, e error) {
 
 // Watch starts watching GPSD reports in a new goroutine.
 //
+//	done return true if gpsd service is not running or quit chan executed
+//	quit chan stop reading from gpsd service
+//
 // Example
-//    gps := gpsd.Dial(gpsd.DEFAULT_ADDRESS)
-//    done := gpsd.Watch()
-//    <- done
-func (s *Session) Watch() (done chan bool) {
+//
+//	gps := gpsd.Dial(gpsd.DEFAULT_ADDRESS)
+//	done, quit := gpsd.Watch()
+//
+//	quit <- true
+func (s *Session) Watch() (done chan bool, quit chan bool) {
 	fmt.Fprintf(s.socket, "?WATCH={\"enable\":true,\"json\":true}")
 	done = make(chan bool)
-
-	go watch(done, s)
+	quit = make(chan bool)
+	go watch(done, quit, s)
 
 	return
 }
@@ -228,13 +233,14 @@ func (s *Session) SendCommand(command string) {
 // GPSD reports with the given class. Callback functions have type Filter.
 //
 // Example:
-//    gps := gpsd.Init(gpsd.DEFAULT_ADDRESS)
-//    gps.AddFilter("TPV", func (r interface{}) {
-//      report := r.(*gpsd.TPVReport)
-//      fmt.Println(report.Time, report.Lat, report.Lon)
-//    })
-//    done := gps.Watch()
-//    <- done
+//
+//	gps := gpsd.Init(gpsd.DEFAULT_ADDRESS)
+//	gps.AddFilter("TPV", func (r interface{}) {
+//	  report := r.(*gpsd.TPVReport)
+//	  fmt.Println(report.Time, report.Lat, report.Lon)
+//	})
+//	done, quit := gps.Watch()
+//	<- done
 func (s *Session) AddFilter(class string, f Filter) {
 	s.filters[class] = append(s.filters[class], f)
 }
@@ -245,34 +251,40 @@ func (s *Session) deliverReport(class string, report interface{}) {
 	}
 }
 
-func watch(done chan bool, s *Session) {
+func watch(done chan bool, quit chan bool, s *Session) {
 	// We're not using a JSON decoder because we first need to inspect
 	// the JSON string to determine it's "class"
 	for {
-		if line, err := s.reader.ReadString('\n'); err == nil {
-			var reportPeek gpsdReport
-			lineBytes := []byte(line)
-			if err = json.Unmarshal(lineBytes, &reportPeek); err == nil {
-				if len(s.filters[reportPeek.Class]) == 0 {
-					continue
-				}
+		select {
+		case <-quit:
+			done <- true
+			return
+		default:
+			if line, err := s.reader.ReadString('\n'); err == nil {
+				var reportPeek gpsdReport
+				lineBytes := []byte(line)
+				if err = json.Unmarshal(lineBytes, &reportPeek); err == nil {
+					if len(s.filters[reportPeek.Class]) == 0 {
+						continue
+					}
 
-				if report, err2 := unmarshalReport(reportPeek.Class, lineBytes); err2 == nil {
-					s.deliverReport(reportPeek.Class, report)
+					if report, err2 := unmarshalReport(reportPeek.Class, lineBytes); err2 == nil {
+						s.deliverReport(reportPeek.Class, report)
+					} else {
+						fmt.Println("JSON parsing error 2:", err)
+					}
 				} else {
-					fmt.Println("JSON parsing error 2:", err)
+					fmt.Println("JSON parsing error:", err)
 				}
 			} else {
-				fmt.Println("JSON parsing error:", err)
-			}
-		} else {
-			fmt.Println("Stream reader error (is gpsd running?):", err)
-			if err == io.EOF {
-				break
+				fmt.Println("Stream reader error (is gpsd running?):", err)
+				if err == io.EOF {
+					done <- true
+					return
+				}
 			}
 		}
 	}
-	done <- true
 }
 
 func unmarshalReport(class string, bytes []byte) (interface{}, error) {
